@@ -1,0 +1,16 @@
+{
+  "dependencies": {
+    "nodemailer": "^10.0.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.1",
+    "nodemon": "^3.1.14",
+    "vite": "^8.2.2"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  }
+}
