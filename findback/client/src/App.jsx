@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import heroIllustration from "./assets/hero-illustration.jpg";
 
-const API_URL = "https://your-render-backend.onrender.com/api";
+import API_URL from "./config.js";
 
 const emptyRegister = {
   name: "",
@@ -956,7 +956,10 @@ function App() {
       await fetchCommunityStats();
     } catch (err) {
       console.error(err);
-      setError(err.message);
+      const msg = err.message === "Failed to fetch"
+        ? `Unable to connect to FindBack backend (${API_URL}). Please verify the server is running.`
+        : err.message;
+      setError(msg);
       throw err;
     } finally {
       setLoading(false);
@@ -3931,7 +3934,10 @@ function RegisterModal({
       setResendTimer(30);
     } catch (err) {
       console.error("Send Register OTP failed:", err);
-      setLocalError(err.message || "Failed to send verification OTP.");
+      const msg = err.message === "Failed to fetch"
+        ? `Unable to connect to FindBack backend (${API_URL}). Please verify the server is running.`
+        : err.message || "Failed to send verification OTP.";
+      setLocalError(msg);
       refreshCaptcha();
     } finally {
       setOtpSending(false);

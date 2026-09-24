@@ -13,9 +13,12 @@ const app = express();
 
 const PORT = process.env.PORT || 5001;
 
-const MONGO_URI =
+let rawMongoUri =
   process.env.MONGO_URI ||
   "mongodb://127.0.0.1:27017/findback";
+
+// Auto-clean placeholder angle brackets if present in connection string
+const MONGO_URI = rawMongoUri.replace(/<([^>]+)>/g, "$1");
 
 const JWT_SECRET =
   process.env.JWT_SECRET ||
@@ -102,12 +105,43 @@ async function sendOtpEmail(email, otp, purpose = "Login") {
    MIDDLEWARE
 ========================================================= */
 
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
+  "http://localhost:5175",
+  "http://127.0.0.1:5175",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173",
-      "http://127.0.0.1:5173",
-    ],
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      // Allow any localhost / 127.0.0.1 port
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        return callback(null, true);
+      }
+
+      // Allow deployed domains or whitelisted origins
+      if (
+        origin.endsWith(".onrender.com") ||
+        origin.endsWith(".vercel.app") ||
+        origin.endsWith(".netlify.app") ||
+        origin.endsWith(".github.io") ||
+        allowedOrigins.includes(origin)
+      ) {
+        return callback(null, true);
+      }
+
+      // Allow all origins by default for public API
+      return callback(null, true);
+    },
+    credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })

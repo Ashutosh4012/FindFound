@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import "./Dashboard.css";
 
-const API_URL = "https://your-render-backend.onrender.com/api";
+import API_URL from "../config.js";
 
 // Demo mock data in case your backend is offline
 const MOCK_ITEMS = [

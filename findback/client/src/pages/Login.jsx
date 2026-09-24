@@ -1,7 +1,7 @@
 import { useState } from "react";
 import "../App.css";
 
-const API_URL = "https://your-render-backend.onrender.com/api";
+import API_URL from "../config.js";
 
 export default function Login({ onLogin }) {
   const [email, setEmail] = useState("");
