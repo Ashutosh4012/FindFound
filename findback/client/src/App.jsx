@@ -25,6 +25,35 @@ const emptyReport = {
   image: "",
 };
 
+/* =====================================================
+   SAFE API RESPONSE (Module Level)
+===================================================== */
+
+async function readResponse(response) {
+  const text = await response.text();
+
+  let data = {};
+
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Server returned an invalid response (${response.status}).`
+      );
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.message ||
+        `Request failed with status ${response.status}.`
+    );
+  }
+
+  return data;
+}
+
 function Icon({ children }) {
   return <span className="icon">{children}</span>;
 }
@@ -487,34 +516,6 @@ function App() {
     },
   ]);
 
-  /* =====================================================
-     SAFE API RESPONSE
-  ===================================================== */
-
-  async function readResponse(response) {
-    const text = await response.text();
-
-    let data = {};
-
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(
-          `Server returned an invalid response (${response.status}).`
-        );
-      }
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        data.message ||
-          `Request failed with status ${response.status}.`
-      );
-    }
-
-    return data;
-  }
 
   /* =====================================================
      FETCH ALL REPORTS
