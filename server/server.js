@@ -118,7 +118,39 @@ async function sendOtpEmail(email, otp, purpose = "Login") {
     </div>
   `;
 
-  // 1. Resend API (HTTPS Port 443 - Bypasses Render free tier port 587 block)
+  // 1. Brevo API (Prioritized: sends to ANY recipient email without custom domain requirement)
+  if (process.env.BREVO_API_KEY) {
+    try {
+      const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "api-key": process.env.BREVO_API_KEY,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sender: {
+            name: "FindBack Campus",
+            email: process.env.BREVO_SENDER || GMAIL_USER,
+          },
+          to: [{ email }],
+          subject,
+          textContent: text,
+          htmlContent: html,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        console.log(`✉️ [Brevo API] OTP successfully delivered to ${email} (id: ${data.messageId})`);
+        return data;
+      }
+      console.warn("❌ Brevo API error response:", data);
+    } catch (brevoErr) {
+      console.warn("❌ Brevo API network error:", brevoErr.message);
+    }
+  }
+
+  // 2. Resend API (HTTPS Port 443)
   if (process.env.RESEND_API_KEY) {
     try {
       const res = await fetch("https://api.resend.com/emails", {
@@ -137,54 +169,33 @@ async function sendOtpEmail(email, otp, purpose = "Login") {
       });
       const data = await res.json();
       if (res.ok) {
-        console.log(`✉️ [Resend API] OTP delivered to ${email} (id: ${data.id})`);
+        console.log(`✉️ [Resend API] OTP successfully delivered to ${email} (id: ${data.id})`);
         return data;
       }
-      console.warn("Resend API warning:", data);
+      console.warn("❌ Resend API error:", data);
+      if (data && data.statusCode === 403) {
+        console.error(
+          `⚠️ [Resend Domain Restriction]: onboarding@resend.dev only allows sending to your own Resend account email. To send to other emails (like ${email}), add a BREVO_API_KEY in Render (free 300 emails/day to any address without domain), or verify a domain in Resend.`
+        );
+      }
     } catch (apiErr) {
-      console.warn("Resend API error:", apiErr.message);
+      console.warn("❌ Resend API network error:", apiErr.message);
     }
   }
 
-  // 2. Brevo API (HTTPS Port 443 - Bypasses Render free tier port 587 block)
-  if (process.env.BREVO_API_KEY) {
-    try {
-      const res = await fetch("https://api.brevo.com/v3/smtp/email", {
-        method: "POST",
-        headers: {
-          "api-key": process.env.BREVO_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          sender: {
-            name: "FindBack Campus",
-            email: process.env.BREVO_SENDER || GMAIL_USER,
-          },
-          to: [{ email }],
-          subject,
-          textContent: text,
-          htmlContent: html,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        console.log(`✉️ [Brevo API] OTP delivered to ${email} (id: ${data.messageId})`);
-        return data;
-      }
-      console.warn("Brevo API warning:", data);
-    } catch (brevoErr) {
-      console.warn("Brevo API error:", brevoErr.message);
-    }
+  // 3. Fallback to Nodemailer SMTP (Works locally or on hosting without SMTP port block)
+  try {
+    return await mailTransporter.sendMail({
+      from: process.env.EMAIL_FROM || GMAIL_USER,
+      to: email,
+      subject,
+      text,
+      html,
+    });
+  } catch (smtpErr) {
+    console.error(`❌ SMTP delivery failed for ${email}:`, smtpErr.message);
+    throw smtpErr;
   }
-
-  // 3. Fallback to Nodemailer SMTP
-  return mailTransporter.sendMail({
-    from: process.env.EMAIL_FROM || GMAIL_USER,
-    to: email,
-    subject,
-    text,
-    html,
-  });
 }
 
 /* =========================================================
