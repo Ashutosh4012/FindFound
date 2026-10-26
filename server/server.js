@@ -205,6 +205,12 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
 
+    phone: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
     password: {
       type: String,
       required: true,
@@ -438,7 +444,13 @@ const notificationSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["NEW_MESSAGE", "ITEM_INQUIRY"],
+      enum: [
+        "NEW_MESSAGE",
+        "ITEM_INQUIRY",
+        "INCOMING_CALL",
+        "MISSED_CALL",
+        "CALL_ENDED",
+      ],
       default: "NEW_MESSAGE",
     },
     title: {
@@ -669,6 +681,7 @@ function publicUser(user) {
     name: user.name,
     email: user.email,
     studentId: user.studentId,
+    phone: user.phone || "",
   };
 }
 
@@ -1962,6 +1975,363 @@ app.put("/api/notifications/read-all", authenticate, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to mark all as read.",
+    });
+  }
+});
+
+/* =========================================================
+   VOICE CALL & OWNERSHIP VERIFICATION SIGNALING
+========================================================= */
+
+const activeCallsMap = new Map(); // callId -> CallSession
+
+function sanitizeCall(call) {
+  if (!call) return null;
+  return {
+    callId: call.callId,
+    itemId: call.itemId,
+    itemTitle: call.itemTitle,
+    itemType: call.itemType,
+    itemLocation: call.itemLocation,
+    caller: call.caller,
+    recipient: call.recipient,
+    status: call.status,
+    offer: call.offer,
+    answer: call.answer,
+    iceCandidatesCaller: call.iceCandidatesCaller,
+    iceCandidatesRecipient: call.iceCandidatesRecipient,
+    createdAt: call.createdAt,
+    connectedAt: call.connectedAt,
+    durationSeconds: call.connectedAt
+      ? Math.floor(((call.endedAt || Date.now()) - call.connectedAt) / 1000)
+      : 0,
+  };
+}
+
+// INITIATE CALL
+app.post("/api/calls/initiate", authenticate, async (req, res) => {
+  try {
+    const { itemId, recipientId, offer } = req.body;
+
+    if (!itemId || !recipientId) {
+      return res.status(400).json({
+        success: false,
+        message: "itemId and recipientId are required to start a call.",
+      });
+    }
+
+    if (String(req.userId) === String(recipientId)) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot call yourself.",
+      });
+    }
+
+    const item = await Item.findById(itemId);
+    if (!item) {
+      return res.status(404).json({
+        success: false,
+        message: "Item not found.",
+      });
+    }
+
+    const recipient = await User.findById(recipientId);
+    if (!recipient) {
+      return res.status(404).json({
+        success: false,
+        message: "Recipient user not found.",
+      });
+    }
+
+    const caller = await User.findById(req.userId);
+
+    // End any lingering ringing/connected calls involving this caller or recipient
+    for (const [id, c] of activeCallsMap.entries()) {
+      if (
+        (String(c.caller._id) === String(req.userId) ||
+          String(c.recipient._id) === String(req.userId) ||
+          String(c.recipient._id) === String(recipientId)) &&
+        ["RINGING", "CONNECTED"].includes(c.status)
+      ) {
+        c.status = "ENDED";
+        c.endedAt = Date.now();
+      }
+    }
+
+    const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const callSession = {
+      callId,
+      itemId: item._id,
+      itemTitle: item.title,
+      itemType: item.type,
+      itemLocation: item.location || "Campus",
+      caller: {
+        _id: caller._id,
+        name: caller.name,
+        email: caller.email,
+        phone: caller.phone || "",
+      },
+      recipient: {
+        _id: recipient._id,
+        name: recipient.name,
+        email: recipient.email,
+        phone: recipient.phone || "",
+      },
+      status: "RINGING",
+      offer: offer || null,
+      answer: null,
+      iceCandidatesCaller: [],
+      iceCandidatesRecipient: [],
+      createdAt: Date.now(),
+      connectedAt: null,
+      endedAt: null,
+    };
+
+    activeCallsMap.set(callId, callSession);
+
+    // Create notification for recipient
+    await Notification.create({
+      recipient: recipient._id,
+      sender: caller._id,
+      itemId: item._id,
+      type: "INCOMING_CALL",
+      title: `📞 Incoming Call from ${caller.name}`,
+      content: `Verification call for "${item.title}". Click to answer and verify item ownership.`,
+      read: false,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Call initiated successfully.",
+      call: sanitizeCall(callSession),
+    });
+  } catch (error) {
+    console.error("INITIATE CALL ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to initiate call.",
+    });
+  }
+});
+
+// GET ACTIVE CALL FOR CURRENT USER
+app.get("/api/calls/active", authenticate, async (req, res) => {
+  try {
+    const userIdStr = String(req.userId);
+    let activeCall = null;
+    const now = Date.now();
+
+    for (const [id, c] of activeCallsMap.entries()) {
+      // Auto-expire calls ringing for more than 50 seconds
+      if (c.status === "RINGING" && now - c.createdAt > 50000) {
+        c.status = "MISSED";
+        c.endedAt = now;
+      }
+      // Clean up calls ended > 5 minutes ago
+      if (
+        ["ENDED", "DECLINED", "MISSED"].includes(c.status) &&
+        now - (c.endedAt || c.createdAt) > 300000
+      ) {
+        activeCallsMap.delete(id);
+        continue;
+      }
+
+      if (
+        (String(c.caller._id) === userIdStr || String(c.recipient._id) === userIdStr) &&
+        ["RINGING", "CONNECTED"].includes(c.status)
+      ) {
+        activeCall = c;
+      }
+    }
+
+    res.json({
+      success: true,
+      activeCall: sanitizeCall(activeCall),
+    });
+  } catch (error) {
+    console.error("GET ACTIVE CALL ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to check active call.",
+    });
+  }
+});
+
+// GET CALL STATUS BY ID
+app.get("/api/calls/:callId/status", authenticate, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const call = activeCallsMap.get(callId);
+
+    if (!call) {
+      return res.status(404).json({
+        success: false,
+        message: "Call session not found or expired.",
+      });
+    }
+
+    res.json({
+      success: true,
+      call: sanitizeCall(call),
+    });
+  } catch (error) {
+    console.error("GET CALL STATUS ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch call status.",
+    });
+  }
+});
+
+// ANSWER CALL
+app.post("/api/calls/:callId/answer", authenticate, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const { answer } = req.body;
+    const call = activeCallsMap.get(callId);
+
+    if (!call) {
+      return res.status(404).json({
+        success: false,
+        message: "Call session not found.",
+      });
+    }
+
+    if (String(call.recipient._id) !== String(req.userId)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to answer this call.",
+      });
+    }
+
+    call.status = "CONNECTED";
+    if (answer) call.answer = answer;
+    call.connectedAt = Date.now();
+
+    res.json({
+      success: true,
+      message: "Call answered successfully.",
+      call: sanitizeCall(call),
+    });
+  } catch (error) {
+    console.error("ANSWER CALL ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to answer call.",
+    });
+  }
+});
+
+// DECLINE CALL
+app.post("/api/calls/:callId/decline", authenticate, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const call = activeCallsMap.get(callId);
+
+    if (call) {
+      call.status = "DECLINED";
+      call.endedAt = Date.now();
+    }
+
+    res.json({
+      success: true,
+      message: "Call declined.",
+    });
+  } catch (error) {
+    console.error("DECLINE CALL ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to decline call.",
+    });
+  }
+});
+
+// END CALL
+app.post("/api/calls/:callId/end", authenticate, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const call = activeCallsMap.get(callId);
+
+    if (call) {
+      call.status = "ENDED";
+      call.endedAt = Date.now();
+
+      const durationSeconds = call.connectedAt
+        ? Math.floor((call.endedAt - call.connectedAt) / 1000)
+        : 0;
+
+      // Automatically post a summary message in the chat thread
+      try {
+        const otherUserId =
+          String(req.userId) === String(call.caller._id)
+            ? call.recipient._id
+            : call.caller._id;
+
+        const mins = Math.floor(durationSeconds / 60);
+        const secs = durationSeconds % 60;
+        const durStr =
+          durationSeconds > 0
+            ? `${mins > 0 ? `${mins}m ` : ""}${secs}s`
+            : "No answer";
+
+        await Message.create({
+          itemId: call.itemId,
+          sender: req.userId,
+          recipient: otherUserId,
+          text: `📞 Voice Verification Call · ${durStr}`,
+        });
+      } catch (logErr) {
+        console.warn("Could not log call message:", logErr.message);
+      }
+
+      return res.json({
+        success: true,
+        message: "Call ended.",
+        durationSeconds,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Call already ended or expired.",
+    });
+  } catch (error) {
+    console.error("END CALL ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to end call.",
+    });
+  }
+});
+
+// EXCHANGE ICE CANDIDATE
+app.post("/api/calls/:callId/ice-candidate", authenticate, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const { candidate, role } = req.body;
+    const call = activeCallsMap.get(callId);
+
+    if (!call) {
+      return res.status(404).json({
+        success: false,
+        message: "Call not found.",
+      });
+    }
+
+    if (candidate) {
+      if (role === "caller" || String(req.userId) === String(call.caller._id)) {
+        call.iceCandidatesCaller.push(candidate);
+      } else {
+        call.iceCandidatesRecipient.push(candidate);
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("ICE CANDIDATE ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add ICE candidate.",
     });
   }
 });

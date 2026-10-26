@@ -489,6 +489,23 @@ function App() {
   const [toastNotification, setToastNotification] = useState(null);
 
   /* =====================================================
+     VOICE CALLING / OWNERSHIP VERIFICATION
+  ===================================================== */
+  const [activeCall, setActiveCall] = useState(null); // active call session
+  const [incomingCall, setIncomingCall] = useState(null); // incoming call prompt
+  const [callStatus, setCallStatus] = useState("idle"); // idle | initiating | ringing | connected | ended | declined
+  const [callDuration, setCallDuration] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [callError, setCallError] = useState("");
+  const [revealedPhone, setRevealedPhone] = useState(null);
+
+  const localStreamRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const remoteAudioRef = useRef(null);
+  const callTimerRef = useRef(null);
+  const callPollRef = useRef(null);
+
+  /* =====================================================
      AI CHATBOT (FINDFOUND ASSISTANT)
   ===================================================== */
 
@@ -740,6 +757,408 @@ function App() {
   }
 
   /* =====================================================
+     VOICE CALLING / OWNERSHIP VERIFICATION ACTIONS
+  ===================================================== */
+
+  function playChime(type = "ring") {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      const ctx = new AudioContextClass();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      if (type === "ring") {
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(523.25, ctx.currentTime);
+        osc.frequency.setValueAtTime(659.25, ctx.currentTime + 0.12);
+        osc.frequency.setValueAtTime(783.99, ctx.currentTime + 0.24);
+        gain.gain.setValueAtTime(0.12, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.6);
+      } else if (type === "end") {
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(440, ctx.currentTime);
+        osc.frequency.setValueAtTime(330, ctx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.4);
+      }
+    } catch {
+      // Audio context restricted until user gestures
+    }
+  }
+
+  function cleanupCall() {
+    if (callPollRef.current) {
+      clearInterval(callPollRef.current);
+      callPollRef.current = null;
+    }
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    setActiveCall(null);
+    setCallStatus("idle");
+    setCallDuration(0);
+    setIsMuted(false);
+    setCallError("");
+    setRevealedPhone(null);
+  }
+
+  async function handleStartCall(item, targetUser = null) {
+    if (!currentUser) {
+      setShowLogin(true);
+      setError("Please sign in to call the reporter / finder.");
+      return;
+    }
+
+    const other = targetUser || item?.reportedBy;
+    const otherId =
+      other?._id ||
+      other?.id ||
+      (typeof other === "string" ? other : null);
+    const currentId = currentUser?._id || currentUser?.id;
+
+    if (!otherId || String(otherId) === String(currentId)) {
+      alert("This is your own report. You cannot call yourself.");
+      return;
+    }
+
+    cleanupCall();
+    setCallError("");
+    setCallStatus("initiating");
+    setIsMuted(false);
+    setCallDuration(0);
+    setRevealedPhone(null);
+
+    const otherUserObj =
+      typeof other === "object" && other ? other : { _id: otherId, name: "Student" };
+
+    const initialCallObj = {
+      callId: null,
+      itemId: item._id,
+      itemTitle: item.title,
+      itemType: item.type,
+      itemLocation: item.location || "Campus",
+      itemImage: item.image,
+      caller: currentUser,
+      recipient: otherUserObj,
+      status: "RINGING",
+      role: "caller",
+    };
+    setActiveCall(initialCallObj);
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ],
+    });
+    peerConnectionRef.current = pc;
+
+    pc.ontrack = (event) => {
+      if (remoteAudioRef.current && event.streams[0]) {
+        remoteAudioRef.current.srcObject = event.streams[0];
+        remoteAudioRef.current.play().catch(() => {});
+      }
+    };
+
+    let localStream = null;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+      localStreamRef.current = localStream;
+      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+    } catch (mediaErr) {
+      console.warn("Microphone access prompt dismissed or unavailable:", mediaErr);
+      setCallError("Microphone access unavailable or blocked. You can still use the verification checklist or share mobile contact.");
+    }
+
+    let offer = null;
+    try {
+      offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+    } catch (err) {
+      console.warn("Could not create WebRTC offer:", err);
+    }
+
+    let callData = null;
+    try {
+      const response = await fetch(`${API_URL}/api/calls/initiate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          itemId: item._id,
+          recipientId: otherId,
+          offer,
+        }),
+      });
+      const data = await readResponse(response);
+      if (!data.success) {
+        throw new Error(data.message || "Could not start call.");
+      }
+      callData = data.call;
+      setActiveCall((prev) => ({ ...prev, ...callData, role: "caller" }));
+      setCallStatus("ringing");
+      playChime("ring");
+    } catch (err) {
+      setCallError(err.message || "Failed to start call.");
+      setCallStatus("idle");
+      setActiveCall(null);
+      if (localStream) localStream.getTracks().forEach((t) => t.stop());
+      pc.close();
+      return;
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate && callData?.callId) {
+        fetch(`${API_URL}/api/calls/${callData.callId}/ice-candidate`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            candidate: event.candidate,
+            role: "caller",
+          }),
+        }).catch(() => {});
+      }
+    };
+
+    const pollId = setInterval(async () => {
+      if (!callData?.callId) return;
+      try {
+        const res = await fetch(`${API_URL}/api/calls/${callData.callId}/status`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const statusData = await res.json();
+        if (statusData.success && statusData.call) {
+          const c = statusData.call;
+          if (c.status === "CONNECTED" && c.answer && pc.signalingState !== "stable") {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(c.answer));
+              if (Array.isArray(c.iceCandidatesRecipient)) {
+                for (const cand of c.iceCandidatesRecipient) {
+                  try {
+                    await pc.addIceCandidate(new RTCIceCandidate(cand));
+                  } catch {}
+                }
+              }
+            } catch (sdpErr) {
+              console.warn("SDP error:", sdpErr);
+            }
+            setCallStatus("connected");
+            setActiveCall((prev) => ({ ...prev, ...c }));
+          } else if (c.status === "DECLINED") {
+            setCallStatus("declined");
+            clearInterval(pollId);
+            playChime("end");
+            setTimeout(() => cleanupCall(), 2500);
+          } else if (c.status === "ENDED" || c.status === "MISSED") {
+            setCallStatus("ended");
+            clearInterval(pollId);
+            playChime("end");
+            setTimeout(() => cleanupCall(), 2500);
+          }
+        }
+      } catch (err) {
+        console.error("Poll call error:", err);
+      }
+    }, 1500);
+
+    callPollRef.current = pollId;
+  }
+
+  async function handleAnswerCall() {
+    if (!incomingCall || !token) return;
+    const call = incomingCall;
+    setIncomingCall(null);
+    setCallStatus("connecting");
+    setCallDuration(0);
+    setIsMuted(false);
+    setActiveCall({ ...call, role: "recipient" });
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ],
+    });
+    peerConnectionRef.current = pc;
+
+    pc.ontrack = (event) => {
+      if (remoteAudioRef.current && event.streams[0]) {
+        remoteAudioRef.current.srcObject = event.streams[0];
+        remoteAudioRef.current.play().catch(() => {});
+      }
+    };
+
+    let localStream = null;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+      localStreamRef.current = localStream;
+      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+    } catch (mediaErr) {
+      console.warn("Microphone access unavailable:", mediaErr);
+      setCallError("Microphone access unavailable. You can still use the verification checklist.");
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        fetch(`${API_URL}/api/calls/${call.callId}/ice-candidate`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            candidate: event.candidate,
+            role: "recipient",
+          }),
+        }).catch(() => {});
+      }
+    };
+
+    let answer = null;
+    if (call.offer) {
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(call.offer));
+        if (Array.isArray(call.iceCandidatesCaller)) {
+          for (const cand of call.iceCandidatesCaller) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(cand));
+            } catch {}
+          }
+        }
+        answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+      } catch (err) {
+        console.warn("Answer creation error:", err);
+      }
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/api/calls/${call.callId}/answer`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ answer }),
+      });
+      const data = await readResponse(response);
+      if (data.success) {
+        setCallStatus("connected");
+      }
+    } catch (err) {
+      console.error("Answer API error:", err);
+    }
+
+    const pollId = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/calls/${call.callId}/status`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.success && data.call) {
+          if (["ENDED", "DECLINED"].includes(data.call.status)) {
+            setCallStatus("ended");
+            clearInterval(pollId);
+            playChime("end");
+            setTimeout(() => cleanupCall(), 2500);
+          }
+        }
+      } catch {}
+    }, 1500);
+
+    callPollRef.current = pollId;
+  }
+
+  async function handleDeclineCall() {
+    if (!incomingCall || !token) return;
+    const callId = incomingCall.callId;
+    setIncomingCall(null);
+    try {
+      await fetch(`${API_URL}/api/calls/${callId}/decline`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {}
+  }
+
+  async function handleEndCall() {
+    if (activeCall?.callId && token) {
+      try {
+        await fetch(`${API_URL}/api/calls/${activeCall.callId}/end`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch {}
+    }
+    setCallStatus("ended");
+    playChime("end");
+    setTimeout(() => cleanupCall(), 1500);
+  }
+
+  function handleToggleMute() {
+    if (localStreamRef.current) {
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      if (audioTracks.length > 0) {
+        const nextMuted = !isMuted;
+        audioTracks.forEach((t) => (t.enabled = !nextMuted));
+        setIsMuted(nextMuted);
+      }
+    }
+  }
+
+  async function checkActiveIncomingCall() {
+    if (!token || activeCall) return;
+    try {
+      const res = await fetch(`${API_URL}/api/calls/active`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.success && data.activeCall) {
+        const c = data.activeCall;
+        const myId = currentUser?._id || currentUser?.id;
+        if (String(c.recipient?._id) === String(myId) && c.status === "RINGING") {
+          if (!incomingCall || incomingCall.callId !== c.callId) {
+            setIncomingCall(c);
+            playChime("ring");
+          }
+        }
+      }
+    } catch {}
+  }
+
+  /* =====================================================
      MARK NOTIFICATION READ
   ===================================================== */
 
@@ -872,16 +1291,39 @@ function App() {
     if (token) {
       fetchMatches();
       fetchNotifications(false);
+      checkActiveIncomingCall();
       const interval = setInterval(() => {
         fetchNotifications(true);
-      }, 8000);
+        checkActiveIncomingCall();
+      }, 4000);
       return () => clearInterval(interval);
     } else {
       setMatches([]);
       setNotifications([]);
       setUnreadNotificationsCount(0);
+      setIncomingCall(null);
     }
   }, [token]);
+
+  /* Call duration timer effect */
+  useEffect(() => {
+    if (callStatus === "connected") {
+      callTimerRef.current = setInterval(() => {
+        setCallDuration((prev) => prev + 1);
+      }, 1000);
+    } else {
+      if (callTimerRef.current) {
+        clearInterval(callTimerRef.current);
+        callTimerRef.current = null;
+      }
+    }
+    return () => {
+      if (callTimerRef.current) {
+        clearInterval(callTimerRef.current);
+        callTimerRef.current = null;
+      }
+    };
+  }, [callStatus]);
 
   /* Poll active chat thread every 3 seconds */
   useEffect(() => {
@@ -2900,6 +3342,9 @@ function App() {
                     onOpenChat={
                       handleOpenChat
                     }
+                    onOpenCall={
+                      handleStartCall
+                    }
                     onViewDetails={
                       setSelectedDetailItem
                     }
@@ -2979,6 +3424,7 @@ function App() {
           setChatText={setChatText}
           onSend={handleSendMessage}
           currentUser={currentUser}
+          onOpenCall={handleStartCall}
         />
       )}
 
@@ -2990,6 +3436,35 @@ function App() {
           formatDate={formatDate}
           currentUser={currentUser}
           onOpenChat={handleOpenChat}
+          onOpenCall={handleStartCall}
+        />
+      )}
+
+      {/* HIDDEN AUDIO ELEMENT FOR WEBRTC REMOTE STREAM */}
+      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: "none" }} />
+
+      {/* LIVE CALL MODAL (VOICE VERIFICATION & ITEM OWNERSHIP) */}
+      {activeCall && (
+        <LiveCallModal
+          activeCall={activeCall}
+          callStatus={callStatus}
+          callDuration={callDuration}
+          isMuted={isMuted}
+          onToggleMute={handleToggleMute}
+          onEndCall={handleEndCall}
+          error={callError}
+          revealedPhone={revealedPhone}
+          setRevealedPhone={setRevealedPhone}
+          currentUser={currentUser}
+        />
+      )}
+
+      {/* INCOMING CALL PROMPT */}
+      {incomingCall && (
+        <IncomingCallModal
+          incomingCall={incomingCall}
+          onAnswer={handleAnswerCall}
+          onDecline={handleDeclineCall}
         />
       )}
 
@@ -3054,6 +3529,7 @@ function ReportCard({
   currentUser,
   onDelete,
   onOpenChat,
+  onOpenCall,
   onViewDetails,
 }) {
   const isLost =
@@ -3248,6 +3724,24 @@ function ReportCard({
             </button>
           )}
 
+          {/* VOICE CALL FINDER / REPORTER BUTTON */}
+          {!isMyReport && (
+            <button
+              type="button"
+              className={`call-finder-btn ${
+                isLost ? "call-lost-btn" : "call-found-btn"
+              }`}
+              onClick={() => onOpenCall?.(item)}
+              title={
+                isLost
+                  ? "Voice call the reporter to verify item ownership"
+                  : "Voice call the finder to verify item ownership"
+              }
+            >
+              📞 {isLost ? "Call Reporter" : "Call Finder"}
+            </button>
+          )}
+
           {/* 
               DELETE ONLY IF THIS
               IS THE CURRENT USER'S
@@ -3287,6 +3781,7 @@ function ItemDetailsModal({
   formatDate,
   currentUser,
   onOpenChat,
+  onOpenCall,
 }) {
   if (!item) return null;
 
@@ -3389,18 +3884,32 @@ function ItemDetailsModal({
 
           <div className="details-actions">
             {!isMyReport && (
-              <button
-                type="button"
-                className={`details-chat-btn ${
-                  isLost ? "details-chat-lost" : "details-chat-found"
-                }`}
-                onClick={() => {
-                  onClose();
-                  onOpenChat?.(item);
-                }}
-              >
-                💬 {isLost ? "Contact Reporter" : "Chat with Finder"}
-              </button>
+              <>
+                <button
+                  type="button"
+                  className={`details-chat-btn ${
+                    isLost ? "details-chat-lost" : "details-chat-found"
+                  }`}
+                  onClick={() => {
+                    onClose();
+                    onOpenChat?.(item);
+                  }}
+                >
+                  💬 {isLost ? "Contact Reporter" : "Chat with Finder"}
+                </button>
+                <button
+                  type="button"
+                  className={`details-call-btn ${
+                    isLost ? "details-call-lost" : "details-call-found"
+                  }`}
+                  onClick={() => {
+                    onClose();
+                    onOpenCall?.(item);
+                  }}
+                >
+                  📞 {isLost ? "Call Reporter" : "Call Finder"}
+                </button>
+              </>
             )}
             <button
               type="button"
@@ -4676,6 +5185,7 @@ function ChatModal({
   setChatText,
   onSend,
   currentUser,
+  onOpenCall,
 }) {
   const messagesEndRef = useRef(null);
   const item = activeChat?.item;
@@ -4725,13 +5235,23 @@ function ChatModal({
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            className="close-modal chat-close-btn"
-            onClick={onClose}
-          >
-            ×
-          </button>
+          <div className="chat-header-actions-group">
+            <button
+              type="button"
+              className="chat-voice-call-btn"
+              onClick={() => onOpenCall?.(item, otherUser)}
+              title="Voice call to verify item ownership"
+            >
+              📞 Call
+            </button>
+            <button
+              type="button"
+              className="close-modal chat-close-btn"
+              onClick={onClose}
+            >
+              ×
+            </button>
+          </div>
         </div>
 
         {/* ITEM SNAPSHOT STRIP */}
@@ -5226,6 +5746,253 @@ function AiChatbotWidget({
           {isTyping ? "..." : "Send ➤"}
         </button>
       </form>
+    </div>
+  );
+}
+
+/* =========================================================
+   LIVE CALL MODAL (VOICE VERIFICATION & ITEM OWNERSHIP)
+========================================================= */
+
+function LiveCallModal({
+  activeCall,
+  callStatus,
+  callDuration,
+  isMuted,
+  onToggleMute,
+  onEndCall,
+  error,
+  revealedPhone,
+  setRevealedPhone,
+  currentUser,
+}) {
+  if (!activeCall) return null;
+
+  const itemTitle = activeCall.itemTitle || "Valuable Item";
+  const itemType = activeCall.itemType || "LOST";
+  const isFound = itemType === "FOUND";
+  const myId = currentUser?._id || currentUser?.id;
+  const isCaller = String(activeCall.caller?._id) === String(myId);
+  const otherParty = isCaller ? activeCall.recipient : activeCall.caller;
+  const otherName = otherParty?.name || "Student";
+  const otherInitial = (otherName.charAt(0) || "U").toUpperCase();
+
+  const formatTimer = (secs) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  };
+
+  const isRinging = callStatus === "ringing" || callStatus === "initiating";
+  const isConnected = callStatus === "connected";
+  const isEnded = callStatus === "ended" || callStatus === "declined";
+
+  return (
+    <div className="modal-overlay call-modal-overlay">
+      <div className="call-modal-window">
+        {/* CALL HEADER STRIP */}
+        <div className="call-header-strip">
+          <div className="call-item-pill">
+            <span
+              className={`call-type-badge ${
+                isFound ? "badge-found" : "badge-lost"
+              }`}
+            >
+              {isFound ? "✓ FOUND ITEM" : "⌕ LOST ITEM"}
+            </span>
+            <span className="call-item-title-text">{itemTitle}</span>
+          </div>
+          <div className="call-status-pill">
+            {isRinging && <span className="call-pulse-dot" />}
+            {isConnected && <span className="call-live-dot" />}
+            <span className="call-status-label">
+              {isRinging
+                ? isCaller
+                  ? "Ringing reporter..."
+                  : "Connecting..."
+                : isConnected
+                ? `In Call · ${formatTimer(callDuration)}`
+                : isEnded
+                ? "Call Ended"
+                : "Connecting..."}
+            </span>
+          </div>
+        </div>
+
+        {/* CALL HERO AREA */}
+        <div className="call-hero-area">
+          <div
+            className={`call-avatar-outer ${
+              isRinging
+                ? "ringing-pulse"
+                : isConnected
+                ? "connected-pulse"
+                : ""
+            }`}
+          >
+            <div className="call-avatar-inner">{otherInitial}</div>
+          </div>
+          <h3 className="call-party-name">{otherName}</h3>
+          <p className="call-subtitle">
+            {isCaller
+              ? "Voice call regarding reported item"
+              : "Calling you about your reported item"}
+          </p>
+
+          {/* AUDIO WAVE VISUALIZER */}
+          {isConnected && (
+            <div className="call-audio-wave">
+              <span className="wave-bar b1" />
+              <span className="wave-bar b2" />
+              <span className="wave-bar b3" />
+              <span className="wave-bar b4" />
+              <span className="wave-bar b5" />
+            </div>
+          )}
+        </div>
+
+        {/* VERIFICATION CHECKLIST CARD */}
+        <div className="call-verification-card">
+          <div className="verification-card-header">
+            <span className="verify-shield-icon">🛡️</span>
+            <h4>Ownership Verification Questions</h4>
+          </div>
+          <p className="verification-card-intro">
+            Ask these critical questions to confirm it is genuinely his/her item before meeting:
+          </p>
+          <ul className="verification-checklist">
+            <li>
+              <strong>1. Unique Identifiers:</strong> Ask for hidden markings, scratches, stickers, or brand tags not shown in public pictures.
+            </li>
+            <li>
+              <strong>2. Exact Contents:</strong> For bags, wallets, or cases, ask them to name the specific cards, bills, or items inside.
+            </li>
+            <li>
+              <strong>3. If Electronics:</strong> Ask for lock screen wallpaper, case color, passcode confirmation, or serial digits.
+            </li>
+            <li>
+              <strong>4. Safe Campus Handover:</strong> Always meet in a public, staffed area (e.g. University Library, Security Desk).
+            </li>
+          </ul>
+        </div>
+
+        {error && (
+          <div className="call-error-banner">
+            ⚠️ {error}
+          </div>
+        )}
+
+        {/* CONTROLS BAR */}
+        <div className="call-controls-bar">
+          <button
+            type="button"
+            className={`call-ctrl-btn ${isMuted ? "muted" : ""}`}
+            onClick={onToggleMute}
+            disabled={!isConnected}
+            title={isMuted ? "Unmute Microphone" : "Mute Microphone"}
+          >
+            {isMuted ? "🔇 Unmute" : "🎙️ Mute"}
+          </button>
+
+          <button
+            type="button"
+            className="call-end-btn"
+            onClick={onEndCall}
+            title="End Call"
+          >
+            ☎️ End Call
+          </button>
+
+          {/* DIRECT PHONE NUMBER OPTION */}
+          {otherParty?.phone ? (
+            <button
+              type="button"
+              className="call-ctrl-btn phone-direct-btn"
+              onClick={() => setRevealedPhone((prev) => !prev)}
+              title="View cellular phone number"
+            >
+              📱 {revealedPhone ? otherParty.phone : "Phone Number"}
+            </button>
+          ) : (
+            <a
+              href={`mailto:${otherParty?.email || ""}`}
+              className="call-ctrl-btn phone-direct-btn"
+              title="Send email verification"
+            >
+              ✉️ Email
+            </a>
+          )}
+        </div>
+
+        {revealedPhone && otherParty?.phone && (
+          <div className="call-phone-reveal-box">
+            <span>
+              Direct Mobile: <strong>{otherParty.phone}</strong>
+            </span>
+            <a href={`tel:${otherParty.phone}`} className="phone-dial-link">
+              📞 Dial on Mobile
+            </a>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================
+   INCOMING CALL MODAL
+========================================================= */
+
+function IncomingCallModal({ incomingCall, onAnswer, onDecline }) {
+  if (!incomingCall) return null;
+
+  const callerName = incomingCall.caller?.name || "Campus Student";
+  const itemTitle = incomingCall.itemTitle || "Valuable Item";
+  const itemType = incomingCall.itemType || "LOST";
+  const isFound = itemType === "FOUND";
+
+  return (
+    <div className="modal-overlay incoming-call-overlay">
+      <div className="incoming-call-card">
+        <div className="incoming-ringing-indicator">
+          <span className="ringing-bell">📞</span>
+        </div>
+
+        <div className="incoming-header">
+          <span className="incoming-tag">INCOMING VOICE CALL</span>
+          <h3>{callerName}</h3>
+          <p className="incoming-sub">
+            Wants to verify ownership for:
+          </p>
+          <div className="incoming-item-box">
+            <span
+              className={`incoming-badge ${
+                isFound ? "badge-found" : "badge-lost"
+              }`}
+            >
+              {isFound ? "✓ FOUND" : "⌕ LOST"}
+            </span>
+            <strong>{itemTitle}</strong>
+          </div>
+        </div>
+
+        <div className="incoming-actions">
+          <button
+            type="button"
+            className="incoming-btn decline-call-btn"
+            onClick={onDecline}
+          >
+            ✕ Decline
+          </button>
+          <button
+            type="button"
+            className="incoming-btn answer-call-btn"
+            onClick={onAnswer}
+          >
+            📞 Answer Call
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
