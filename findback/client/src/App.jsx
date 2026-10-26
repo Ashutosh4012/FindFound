@@ -1501,7 +1501,7 @@ function App() {
         await readResponse(response);
 
       setOtpEmail(email);
-      setOtpCode(data.previewOtp || "");
+      setOtpCode("");
       setOtpStep("code");
       setError("");
 
@@ -4440,16 +4440,14 @@ function RegisterModal({
 
       const data = await readResponse(response);
       setRegStep("otp");
-      setRegOtp(data.previewOtp || "");
+      setRegOtp("");
       setResendTimer(30);
     } catch (err) {
       console.error("Send Register OTP failed:", err);
       const msg = err.message === "Failed to fetch"
         ? `Unable to connect to FindBack backend (${API_URL}). Please verify the server is running.`
         : err.message || "Failed to send verification OTP.";
-      setLocalError(
-        `${msg} (Tip: Uncheck 'Verify Email with OTP' below to create your account immediately without email delay!)`
-      );
+      setLocalError(msg);
       refreshCaptcha();
     } finally {
       setOtpSending(false);
@@ -4653,25 +4651,9 @@ function RegisterModal({
                 <span>EMAIL VERIFICATION</span>
                 <h2>Enter Verification Code</h2>
                 <p>
-                  We sent a 6-digit OTP to <strong>{form.email}</strong>. Please enter it below
-                  to complete your registration.
+                  We sent a 6-digit OTP to <strong>{form.email}</strong>. Please check your inbox
+                  (and spam folder) and enter it below to complete your registration.
                 </p>
-                {regOtp && (
-                  <div
-                    style={{
-                      marginTop: "10px",
-                      padding: "8px 12px",
-                      background: "rgba(34, 197, 94, 0.12)",
-                      border: "1px solid rgba(34, 197, 94, 0.3)",
-                      borderRadius: "8px",
-                      fontSize: "12px",
-                      color: "#22c55e",
-                      fontWeight: "600",
-                    }}
-                  >
-                    🔑 Auto-detected OTP: <strong>{regOtp}</strong> (Ready to confirm!)
-                  </div>
-                )}
               </div>
 
               {displayedError && <div className="form-error">{displayedError}</div>}

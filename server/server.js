@@ -78,60 +78,112 @@ function deleteOtpFromMemory(email) {
 
 async function sendOtpEmail(email, otp, purpose = "Login") {
   const isRegister = purpose === "Registration";
-  await mailTransporter.sendMail({
-    from:
-      process.env.EMAIL_FROM ||
-      process.env.EMAIL_USER,
-
-    to: email,
-
-    subject: isRegister
-      ? "Your FindBack Registration OTP"
-      : "Your FindBack Login OTP",
-
-    text: isRegister
-      ? `Your FindBack registration verification OTP is ${otp}. This code expires in ${OTP_EXPIRY_MINUTES} minutes.`
-      : `Your FindBack login OTP is ${otp}. This code expires in ${OTP_EXPIRY_MINUTES} minutes.`,
-
-    html: `
-      <div style="font-family: Arial, sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #e2d9f3; border-radius: 12px;">
-        <h2 style="color: #6d4aff; margin-top: 0;">FindBack</h2>
-
-        <p>Hello,</p>
-
-        <p>
-          ${
-            isRegister
-              ? "Use the following One-Time Password (OTP) to verify your university email and complete your FindBack registration:"
-              : "Use the following OTP to sign in to your FindBack account:"
-          }
-        </p>
-
-        <div style="
-          font-size: 32px;
-          font-weight: bold;
-          letter-spacing: 8px;
-          padding: 20px;
-          text-align: center;
-          background: #f5f3ff;
-          color: #5b21b6;
-          border-radius: 10px;
-          margin: 20px 0;
-        ">
-          ${otp}
-        </div>
-
-        <p style="color: #666; font-size: 13px;">
-          This verification OTP will expire in <strong>${OTP_EXPIRY_MINUTES} minutes</strong>.
-        </p>
-
-        <p style="color: #888; font-size: 12px;">
-          If you did not request this registration, please safely ignore this message.
-        </p>
-
-        <p style="margin-bottom: 0; color: #444;">— FindBack Team</p>
+  const subject = isRegister
+    ? "Your FindBack Registration OTP"
+    : "Your FindBack Login OTP";
+  const text = isRegister
+    ? `Your FindBack registration verification OTP is ${otp}. This code expires in ${OTP_EXPIRY_MINUTES} minutes.`
+    : `Your FindBack login OTP is ${otp}. This code expires in ${OTP_EXPIRY_MINUTES} minutes.`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 500px; margin: auto; padding: 24px; border: 1px solid #e2d9f3; border-radius: 12px; background: #ffffff;">
+      <h2 style="color: #6d4aff; margin-top: 0;">FindBack</h2>
+      <p style="font-size: 15px; color: #333;">Hello,</p>
+      <p style="font-size: 15px; color: #333;">
+        ${
+          isRegister
+            ? "Use the following One-Time Password (OTP) to verify your university email and complete your FindBack registration:"
+            : "Use the following OTP to sign in to your FindBack account:"
+        }
+      </p>
+      <div style="
+        font-size: 32px;
+        font-weight: bold;
+        letter-spacing: 8px;
+        padding: 20px;
+        text-align: center;
+        background: #f5f3ff;
+        color: #5b21b6;
+        border-radius: 10px;
+        margin: 20px 0;
+      ">
+        ${otp}
       </div>
-    `,
+      <p style="color: #666; font-size: 13px;">
+        This verification OTP will expire in <strong>${OTP_EXPIRY_MINUTES} minutes</strong>.
+      </p>
+      <p style="color: #888; font-size: 12px;">
+        If you did not request this, please safely ignore this message.
+      </p>
+      <p style="margin-bottom: 0; color: #444;">— FindBack Team</p>
+    </div>
+  `;
+
+  // 1. Resend API (HTTPS Port 443 - Bypasses Render free tier port 587 block)
+  if (process.env.RESEND_API_KEY) {
+    try {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: process.env.RESEND_FROM || "FindBack <onboarding@resend.dev>",
+          to: [email],
+          subject,
+          text,
+          html,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        console.log(`✉️ [Resend API] OTP delivered to ${email} (id: ${data.id})`);
+        return data;
+      }
+      console.warn("Resend API warning:", data);
+    } catch (apiErr) {
+      console.warn("Resend API error:", apiErr.message);
+    }
+  }
+
+  // 2. Brevo API (HTTPS Port 443 - Bypasses Render free tier port 587 block)
+  if (process.env.BREVO_API_KEY) {
+    try {
+      const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+          "api-key": process.env.BREVO_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sender: {
+            name: "FindBack Campus",
+            email: process.env.BREVO_SENDER || GMAIL_USER,
+          },
+          to: [{ email }],
+          subject,
+          textContent: text,
+          htmlContent: html,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        console.log(`✉️ [Brevo API] OTP delivered to ${email} (id: ${data.messageId})`);
+        return data;
+      }
+      console.warn("Brevo API warning:", data);
+    } catch (brevoErr) {
+      console.warn("Brevo API error:", brevoErr.message);
+    }
+  }
+
+  // 3. Fallback to Nodemailer SMTP
+  return mailTransporter.sendMail({
+    from: process.env.EMAIL_FROM || GMAIL_USER,
+    to: email,
+    subject,
+    text,
+    html,
   });
 }
 
@@ -853,7 +905,6 @@ app.post("/api/auth/send-register-otp", async (req, res) => {
     return res.json({
       success: true,
       message: "Verification OTP sent to your university email.",
-      previewOtp: otp,
     });
   } catch (error) {
     console.error("SEND REGISTER OTP ERROR:", error);
@@ -1158,7 +1209,6 @@ app.post("/api/auth/send-otp", async (req, res) => {
     return res.json({
       success: true,
       message: "OTP sent successfully to your email.",
-      previewOtp: otp,
     });
   } catch (error) {
     console.error("SEND OTP ERROR:", error);
